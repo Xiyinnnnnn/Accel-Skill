@@ -1,6 +1,6 @@
-# ⚡ Accel-Skill
+# Accel-Skill
 
-> **极限压榨模型性能** — 多子代理并发流水线技能包，把每一次 API 调用压到极限价值。
+> 极限压榨模型性能 — 多子代理并发流水线技能包，把每一次 API 调用压到极限价值。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)]()
@@ -19,7 +19,7 @@
 
 ---
 
-## 🚀 快速开始（一键复制）
+## 快速开始（一键复制）
 
 ```bash
 # 方式一：git clone（推荐，含 README/协议）
@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster
 
 ```bash
 # 零成本自测（mock 模式，不联网不耗 key，工具链真实执行）
-python3 ~/skills/Trial/trial.py   --docs 资料目录 --work 工作目录 --goals "A|B" --mock
+python3 ~/skills/Trial/trial.py     --docs 资料目录 --work 工作目录 --goals "A|B" --mock
 python3 ~/skills/Booster/booster.py --docs 资料目录 --work 工作目录 --modules N --per-module X --goal "大目标" --mock
 
 # 真实调用（key/端点/模型由使用方提供，仅进程内不落盘）
@@ -49,47 +49,39 @@ python3 ~/skills/Trial/trial.py --docs 资料 --work 工作 --goals "A|B" --key 
 
 ---
 
-## 🔄 主循环模式
+## 主循环模式
 
 ### Trial — 头脑风暴收敛循环
 
-```
-        ┌───────────────────────────────────────────────┐
-        │ 阶段1 独立推理   N 子agent 并发                │
-        │ system+资料+目标 → round1/agent_i.md           │
-        └───────────────────┬───────────────────────────┘
-                            ▼
-        ┌───────────────────────────────────────────────┐
-        │ 阶段2 整合       N 子agent                     │
-        │ 通读全部 round1 → round2/agent_i.md            │
-        └───────────────────┬───────────────────────────┘
-                            ▼
-        ┌───────────────────────────────────────────────┐
-        │ 阶段3 淘汰循环   ceil(上轮/2) 子agent          │
-        │ 随机配对 A/B → 整合改进 → 劣者抛弃              │
-        │ 奇数时最后1份轮空晋级(0调用)                    │
-        │                                                │
-        │   ┌── 仅剩 1 份？──否──► 下一轮(数量减半)       │
-        │   └──────是──────────► final.md 交付主agent     │
-        └───────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["阶段1: 独立推理<br/>N 子agent并发<br/>system+资料+目标"] --> B["round1/agent_i.md"]
+    B --> C["阶段2: 整合<br/>通读全部 round1"]
+    C --> D["round2/agent_i.md"]
+    D --> E["阶段3: 淘汰循环<br/>随机配对 A/B<br/>整合改进 劣者抛弃"]
+    E --> F{"仅剩 1 份?"}
+    F -- "否(数量减半, 奇数份轮空晋级)" --> E
+    F -- "是" --> G["final.md 交付主agent"]
 ```
 
 **文件权威**：子 agent 一切结论必须 `write_md` 落盘，无 md = 无产出 = 失败；被淘汰方案留在原轮次（证据链），剔除 = 下一轮不引用。
 
 ### Booster — 模块化工程流水线
 
-```
- N×X 并发开发 ──► N 评价淘汰 ──► Y 组合 ──► Y 合并(测到死) ──► Y 审查(SCORE) ──► final.md
- 模块变体        多维评分表      按大目标方向  集成测试+排查排错   安全/性能/覆盖     最优主体
- (测到死PASS)    (剔除最低分)    best/stab/    (不过则修)        (最高分晋升)
-                                safety/light
+```mermaid
+flowchart LR
+    A["N×X 并发开发<br/>模块变体<br/>(测到死 PASS)"] --> B["N 评价淘汰<br/>多维评分表<br/>(剔除最低分)"]
+    B --> C["Y 组合<br/>按大目标方向<br/>best/stability/safety/lightweight"]
+    C --> D["Y 合并测到死<br/>集成测试+排查排错<br/>(不过则修)"]
+    D --> E["Y 审查 SCORE<br/>安全/性能/覆盖<br/>(最高分晋升)"]
+    E --> F["final.md 最优主体"]
 ```
 
 **测到死**：每模块变体必须含单元测试清单全 PASS 才参与组合；合并必须集成测试 PASS；审查必须 SCORE 可解析——程序层强制，一项不过不进入交付。
 
 ---
 
-## 📈 预期性能提升
+## 预期性能提升
 
 | 维度 | 单 agent 单轮 | Trial | Booster |
 |---|---|---|---|
@@ -101,7 +93,7 @@ python3 ~/skills/Trial/trial.py --docs 资料 --work 工作 --goals "A|B" --key 
 
 一句话：**同样的模型，从"一次想一个"变成"一群想、择优收敛"**——多样性靠并发，收敛靠淘汰，质量靠验收。
 
-## 💰 成本开销（完全可预测）
+## 成本开销（完全可预测）
 
 子 agent 调用次数为**固定公式**，无隐藏开销：
 
@@ -117,13 +109,13 @@ python3 ~/skills/Trial/trial.py --docs 资料 --work 工作 --goals "A|B" --key 
 
 ---
 
-## 🛠 技术底座
+## 技术底座
 
 - **超轻量**：单文件纯标准库（无第三方依赖），`#!/usr/bin/env python3` 直接跑
 - **安全**：realpath 路径校验（读限资料/工作目录、写限工作目录）、覆盖他人产出拒绝、危险操作全由宿主管理
 - **重型 prompt**：子 agent SYSTEM 写死（ROLE/IDENTITY/BOUNDARY/THINK/MUST/EXAMPLE/RULES），工具 schema 写死（list_dir/read_file/write_md）
 - **agent 友好**：`--json` 结构化输出、退出码语义化、目标三来源
 
-## 📄 协议
+## 协议
 
 [MIT](LICENSE) © 2026 Xiyinnnnnn — 自由使用、修改、分发。
