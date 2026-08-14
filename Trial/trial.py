@@ -6,51 +6,21 @@ from concurrent.futures import ThreadPoolExecutor
 API_URL   = os.environ.get("TRIAL_API_URL", "")
 MODEL     = os.environ.get("TRIAL_MODEL", "")
 MAX_AGENT = 256
-TOOL_ROUNDS = 40
 RETRY_MAX  = 3
+MAX_READ  = 20000
 
-SYSTEM = """[ROLE] 头脑风暴子代理（Trial Worker）| [LANG] zh-CN
-[IDENTITY] 主代理的独立推理单元; 仅对分配目标负责, 产出以md落盘为准
-
-[BOUNDARY]
-- 资料目录: 只读(list_dir/read_file)
-- 工作目录: 只写md(write_md), 禁止覆盖他人产出
-- 无删除/移动权限; 文件管理由宿主程序负责
-
-[FILE_AUTHORITY]
-- 一切结论必须写入md文件; 无md = 无产出 = 任务失败
-- 产出md结构: 标题 / 结论先行 / 依据来源 / 待整合项
-
-[THINK] 推理协议(<think>包裹, 不进md):
-  P1 拆解目标 -> P2 读资料(不编造) -> P3 独立推理 -> P4 write_md落盘 -> P5 自检
-
-[MUST]
-- 先读资料再推理, 禁止凭空编造
-- 工具仅三种: list_dir / read_file / write_md
-- 写路径必须位于工作目录内; 读路径限资料目录与工作目录
-- 会话结束前必须完成 write_md; 未落盘=失败
-
-<EXAMPLE>
-目标: {目标}
-<think>P1 拆解:{要点} P2 读资料:list_dir->read_file {文件} P3 推理:{要点} P4 落盘:write_md {路径}</think>
-最终必须调用 write_md 写入 {产出路径}
-</EXAMPLE>
-
-[RULES]
-- 参数写死; 文件权威; 禁止越权工具
-- 删除/覆盖由宿主管理, 子代理无此权限
-- 推理深度优先, 宁少勿空"""
+SYSTEM = """[ROLE] 头脑风暴子代理（Trial Worker）| [LANG] zh-CN [IDENTITY] 主代理的独立推理单元; 仅对分配目标负责, 产出以md落盘为准
+[BOUNDARY] - 资料目录: 只读(list_dir/read_file) - 工作目录: 只写md(write_md), 禁止覆盖他人产出 - 无删除/移动权限; 文件管理由宿主程序负责
+[FILE_AUTHORITY] - 一切结论必须写入md文件; 无md = 无产出 = 任务失败 - 产出md结构: 标题 / 结论先行 / 依据来源 / 待整合项
+[THINK] 推理协议(<think>包裹, 不进md):   P1 拆解目标 -> P2 读资料(不编造) -> P3 独立推理 -> P4 write_md落盘 -> P5 自检
+[MUST] - 先读资料再推理, 禁止凭空编造 - 工具仅三种: list_dir / read_file / write_md - 写路径必须位于工作目录内; 读路径限资料目录与工作目录 - 会话结束前必须完成 write_md; 未落盘=失败
+<EXAMPLE> 目标: {目标} <think>P1 拆解:{要点} P2 读资料:list_dir->read_file {文件} P3 推理:{要点} P4 落盘:write_md {路径}</think> 最终必须调用 write_md 写入 {产出路径} </EXAMPLE>
+[RULES] - 参数写死; 文件权威; 禁止越权工具 - 删除/覆盖由宿主管理, 子代理无此权限 - 推理深度优先, 宁少勿空"""
 
 TOOLS = [
- {"type":"function","function":{"name":"list_dir",
-   "description":"列出指定目录内文件(只读, 限资料目录与工作目录)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string","description":"目录绝对路径"}},"required":["path"]}}},
- {"type":"function","function":{"name":"read_file",
-   "description":"读取文件全部内容(只读, 限资料目录与工作目录)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
- {"type":"function","function":{"name":"write_md",
-   "description":"写入markdown文件(唯一写工具, 限工作目录, 禁止覆盖他人产出)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+  {"type":"function","function":{"name":"list_dir",    "description":"列出指定目录内文件(只读, 限资料目录与工作目录)",    "parameters":{"type":"object","properties":{"path":{"type":"string","description":"目录绝对路径"}},"required":["path"]}}},
+  {"type":"function","function":{"name":"read_file",    "description":"读取文件内容(只读, 限资料目录与工作目录, 超长截断)",    "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+  {"type":"function","function":{"name":"write_md",    "description":"写入markdown文件(唯一写工具, 限工作目录, 禁止覆盖他人产出)",    "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
 ]
 
 def log(*a):
@@ -98,7 +68,10 @@ def t_read_file(args, ctx):
         return "错误: 不是文件: " + p
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
-            return f.read()
+            s = f.read(MAX_READ)
+            if f.read(1):
+                s += "\n...(截断: 文件超长)"
+            return s
     except Exception as e:
         return "错误: 读取失败: %s" % e
 
@@ -181,8 +154,9 @@ def llm_call(messages, cfg):
     raise RuntimeError("LLM失败: " + last)
 
 def agent_session(messages, cfg, ctx):
-    ctx["wrote"] = []
-    for _ in range(TOOL_ROUNDS):
+    ctx = dict(ctx, wrote=[])
+    msg = {}
+    while True:
         resp = llm_call(messages, cfg)
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         tcs = msg.get("tool_calls") or []
@@ -199,7 +173,6 @@ def agent_session(messages, cfg, ctx):
             impl = TOOL_IMPL.get(name)
             result = impl(args, ctx) if impl else "未知工具: %s" % name
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": str(result)})
-    return None, False
 
 def phase1_agent(i, goal, cfg, ctx):
     out = os.path.join(ctx["r1"], "agent_%d.md" % i)
@@ -243,6 +216,44 @@ def phase3_agent(i, a, b, cfg, ctx):
     content, ok = agent_session(msgs, cfg, ctx)
     return i, out, ok
 
+def _sig(p):
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            t = f.read(4000)
+    except Exception:
+        return set()
+    return set(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", t))
+
+def _sim(a, b):
+    x, y = _sig(a), _sig(b)
+    if not x or not y:
+        return 0.0
+    return len(x & y) / float(len(x | y))
+
+def _pair(cur, cur_dir):
+    pairs, pool = [], cur[:]
+    while len(pool) > 1:
+        a = pool.pop(0)
+        j = max(range(len(pool)), key=lambda t: _sim(os.path.join(cur_dir, a), os.path.join(cur_dir, pool[t])))
+        pairs.append((a, pool.pop(j)))
+    if pool:
+        pairs.append((pool[0],))
+    return pairs
+
+def _passable(p):
+    try:
+        s = open(p, encoding="utf-8", errors="replace").read().strip()
+    except Exception:
+        return False
+    return len(s) > 20 and bool(re.search(r"结论|方案|PASS|通过", s))
+
+def _final_src(cur, cur_dir):
+    cand = [f for f in cur if _passable(os.path.join(cur_dir, f))]
+    if not cand:
+        log("警告: 无合格最终方案, 取最大文件兜底")
+        cand = cur
+    return os.path.join(cur_dir, max(cand, key=lambda f: os.path.getsize(os.path.join(cur_dir, f))))
+
 def parse_goals(args):
     if args.goals:
         return [g.strip() for g in args.goals.split("|") if g.strip()]
@@ -259,7 +270,15 @@ def calc_workers(n, cfg):
 
 def run_pool(tasks, cfg):
     with ThreadPoolExecutor(max_workers=calc_workers(len(tasks), cfg)) as ex:
-        return list(ex.map(lambda t: t[0](*t[1]), tasks))
+        futs = [ex.submit(t[0], *t[1]) for t in tasks]
+        out = []
+        for f in futs:
+            try:
+                out.append(f.result())
+            except Exception as e:
+                log("代理异常(标记失败): %s" % e)
+                out.append(None)
+        return out
 
 def main():
     ap = argparse.ArgumentParser(description="Trial 头脑风暴宿主: 多子代理并发头脑风暴, 文件权威收敛", add_help=False)
@@ -270,7 +289,7 @@ def main():
     g.add_argument("--goals-file", help="目标文件, 每行一个")
     g.add_argument("--goals-json", help='目标JSON数组, 如 ["a","b","a"]')
     ap.add_argument("--workers", type=int, default=0, help="并发数0-256, 0=全并行(默认)")
-    ap.add_argument("--key", help="用户授权API key(仅进程内, 不落盘)")
+    ap.add_argument("--key", default=os.environ.get("TRIAL_KEY", ""), help="用户授权API key(仅进程内, 不落盘; 或环境变量 TRIAL_KEY)")
     ap.add_argument("--model", default=MODEL, help="模型名(真调用必填; 或环境变量 TRIAL_MODEL)")
     ap.add_argument("--api-url", default=API_URL, help="API地址(真调用必填; 或环境变量 TRIAL_API_URL)")
     ap.add_argument("--mock", action="store_true", help="模拟LLM, 不联网不耗key")
@@ -284,7 +303,7 @@ def main():
         sys.exit("错误: 目标数须为1-%d, 当前%d" % (MAX_AGENT, len(goals)))
     if not args.mock:
         if not args.key:
-            sys.exit("错误: 非mock模式必须 --key 传入用户授权API key")
+            sys.exit("错误: 非mock模式必须 --key 或环境变量 TRIAL_KEY 传入用户授权API key")
         if not args.api_url:
             sys.exit("错误: 非mock模式必须 --api-url 或环境变量 TRIAL_API_URL")
         if not args.model:
@@ -307,7 +326,7 @@ def main():
 
     log("阶段1: %d个子代理并发(%s)" % (len(goals), goals))
     res1 = run_pool([(phase1_agent, (i, g, copy.copy(cfg), ctx)) for i, g in enumerate(goals)], cfg)
-    ok1 = [r for r in res1 if r[2]]
+    ok1 = [r for r in res1 if r and r[2]]
     log("阶段1产出: %d/%d 份md" % (len(ok1), len(goals)))
     rounds_out["round1"] = [os.path.basename(r[1]) for r in ok1]
 
@@ -316,7 +335,7 @@ def main():
         sys.exit("错误: 阶段1无产出, 终止")
     log("阶段2: %d个子代理整合round1" % len(r1_files))
     res2 = run_pool([(phase2_agent, (i, copy.copy(cfg), ctx)) for i in range(len(r1_files))], cfg)
-    ok2 = [r for r in res2 if r[2]]
+    ok2 = [r for r in res2 if r and r[2]]
     log("阶段2产出: %d/%d 份md" % (len(ok2), len(r1_files)))
     rounds_out["round2"] = [os.path.basename(r[1]) for r in ok2]
 
@@ -324,23 +343,35 @@ def main():
     rnd = 2
     rng = random.Random(args.seed)
     total_calls = len(goals) + len(r1_files)
-    while len(cur) > 1:
+    while len(cur) > 1:  # 无限轮次: 收敛条件仅剩"文件数>1"
         rnd += 1
         nxt = os.path.join(work, "round%d" % rnd); ensure(nxt)
         rng.shuffle(cur)
-        pairs = [cur[i:i+2] for i in range(0, len(cur), 2)]
-        tasks, calls = [], 0
+        pairs = _pair(cur, cur_dir)
+        tasks, calls, task_args = [], 0, []
         for pi, pair in enumerate(pairs):
             if len(pair) == 1:
-                shutil.copy2(os.path.join(cur_dir, pair[0]), os.path.join(nxt, "agent_%d.md" % pi))
+                src = os.path.join(cur_dir, pair[0])
+                if not _passable(src):
+                    log("警告: 轮空晋级文件不合格: %s (仍晋级)" % pair[0])
+                shutil.copy2(src, os.path.join(nxt, "agent_%d.md" % pi))
                 log("轮空晋级: %s -> round%d" % (pair[0], rnd))
                 continue
-            tasks.append((phase3_agent, (pi, os.path.join(cur_dir, pair[0]),
-                                         os.path.join(cur_dir, pair[1]), copy.copy(cfg), ctx)))
+            a, b = os.path.join(cur_dir, pair[0]), os.path.join(cur_dir, pair[1])
+            tasks.append((phase3_agent, (pi, a, b, copy.copy(cfg), ctx)))
+            task_args.append((pi, a, b))
             calls += 1
         ctx["cur"], ctx["nxt"] = cur_dir, nxt
         res = run_pool(tasks, cfg) if tasks else []
-        okn = [r for r in res if r[2]]
+        okn = []
+        for (pi, a, b), r in zip(task_args, res):
+            if r and r[2] and os.path.isfile(os.path.join(nxt, "agent_%d.md" % pi)):
+                okn.append(r)
+                continue
+            src = a if os.path.getsize(a) >= os.path.getsize(b) else b
+            shutil.copy2(src, os.path.join(nxt, "agent_%d.md" % pi))
+            log("回退晋级(合并失败): %s -> round%d" % (os.path.basename(src), rnd))
+            okn.append((pi, os.path.join(nxt, "agent_%d.md" % pi), True))
         total_calls += calls
         log("阶段3-第%d轮: 输入%d -> 子代理%d(调用%d) -> 产出%d (淘汰%d)" % (
             rnd - 2, len(cur), calls, calls, len(okn), len(cur) - len(pairs)))
@@ -350,7 +381,7 @@ def main():
             sys.exit("错误: 阶段3某轮无产出, 终止")
 
     final = os.path.join(work, "final.md")
-    shutil.copy2(os.path.join(cur_dir, cur[0]), final)
+    shutil.copy2(_final_src(cur, cur_dir), final)
     log("完成: 最终方案 = %s (总子代理调用 %d)" % (final, total_calls))
 
     if args.json:
