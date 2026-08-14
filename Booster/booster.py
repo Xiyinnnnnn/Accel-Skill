@@ -1,61 +1,32 @@
 #!/usr/bin/env python3
-import json, os, sys, argparse, copy, random, re, shutil, time
-import urllib.request, urllib.error
+import json, os, sys, argparse, copy, random, re, shutil, time, select
+import urllib.request, urllib.error, subprocess, threading
 from concurrent.futures import ThreadPoolExecutor
 
 API_URL   = os.environ.get("BOOSTER_API_URL", "")
 MODEL     = os.environ.get("BOOSTER_MODEL", "")
 MAX_AGENT = 256
-TOOL_ROUNDS = 40
 RETRY_MAX  = 3
+MAX_READ  = 20000
 DIM_KEYS  = ["score", "stability", "safety", "lightness"]
 DIM_NAMES = {"best": "score", "stability": "stability", "safety": "safety", "lightweight": "lightness"}
+DANGER_RE = re.compile(r"(?:\beval\b|\b(?:bash|zsh|sh|python|python3|perl|ruby)\s+-c\b|base64|\$\(|`)")
+SYS_PREFIX = ("/usr/", "/bin/", "/sbin/", "/lib", "/proc/", "/dev/", "/sys/")
 
-SYSTEM = """[ROLE] 工程子代理（Booster Worker）| [LANG] zh-CN
-[IDENTITY] 主代理任务流水线中的模块化工程单元; 按阶段指令交付md, 以文件为准
-
-[BOUNDARY]
-- 资料目录: 只读
-- 工作目录: 可读全部轮次产出; 只写md(write_md); 禁止覆盖他人产出
-- 删除/移动由宿主管理
-
-[VERIFY]
-- 交付前必须完成验收: 产出md必须含单元测试清单且全部 PASS
-- 一项不过 = 不进入交付 = 任务失败
-
-[FILE_AUTHORITY]
-- 一切结论写入md; 无md = 无产出 = 失败
-- 产出md结构: 标题 / 结论先行 / 依据来源 / 测试验收
-
-[THINK] 推理协议(<think>包裹, 不进md):
-  P1 拆解 -> P2 读资料 -> P3 推理/实现 -> P4 write_md落盘 -> P5 自检(验收必过)
-
-[MUST]
-- 工具仅三种: list_dir / read_file / write_md
-- 先读再写, 禁止编造; 阶段指令(user消息)定义当前职责与产出格式
-- 会话结束前必须 write_md 完成交付; 未落盘=失败
-
-<EXAMPLE>
-阶段指令: {阶段职责}
-<think>P1拆解:{要点} P2读:{文件} P3实现:{要点} P4落盘:write_md {路径} P5验收:{全部PASS}</think>
-最终必须调用 write_md 写入 {产出路径}
-</EXAMPLE>
-
-[RULES]
-- 参数写死; 文件权威; 验收不过不交付
-- 删除/覆盖由宿主管理
-- 宁缺毋滥, 不产出=失败"""
+SYSTEM = """[ROLE] 工程子代理（Booster Worker）| [LANG] zh-CN [IDENTITY] 主代理任务流水线中的模块化工程单元; 按阶段指令交付md, 以文件为准
+[BOUNDARY] - 资料目录: 只读 - 工作目录: 可读全部轮次产出; 只写md(write_md); 禁止覆盖他人产出; shell仅限工作目录cwd执行 - 删除/移动由宿主管理
+[VERIFY] - 交付前必须完成验收: 产出md必须含单元测试清单且全部 PASS; 可用shell实际测试 - 一项不过 = 不进入交付 = 任务失败
+[FILE_AUTHORITY] - 一切结论写入md; 无md = 无产出 = 失败 - 产出md结构: 标题 / 结论先行 / 依据来源 / 测试验收
+[THINK] 推理协议(<think>包裹, 不进md):   P1 拆解 -> P2 读资料 -> P3 推理/实现 -> P4 write_md落盘 -> P5 自检(验收必过)
+[MUST] - 工具: list_dir / read_file / write_md / shell(实际测试运行; 危险命令需主agent授权) - 先读再写, 禁止编造; 阶段指令(user消息)定义当前职责与产出格式 - 会话结束前必须 write_md 完成交付; 未落盘=失败
+<EXAMPLE> 阶段指令: {阶段职责} <think>P1拆解:{要点} P2读:{文件} P3实现:{要点} P4落盘:write_md {路径} P5验收:{全部PASS}</think> 最终必须调用 write_md 写入 {产出路径} </EXAMPLE>
+[RULES] - 参数写死; 文件权威; 验收不过不交付 - 删除/覆盖由宿主管理 - 宁缺毋滥, 不产出=失败"""
 
 TOOLS = [
- {"type":"function","function":{"name":"list_dir",
-   "description":"列出指定目录内文件(只读, 限资料目录与工作目录)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string","description":"目录绝对路径"}},"required":["path"]}}},
- {"type":"function","function":{"name":"read_file",
-   "description":"读取文件全部内容(只读, 限资料目录与工作目录)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
- {"type":"function","function":{"name":"write_md",
-   "description":"写入markdown文件(唯一写工具, 限工作目录, 禁止覆盖他人产出)",
-   "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+  {"type":"function","function":{"name":"list_dir",    "description":"列出指定目录内文件(只读, 限资料目录与工作目录)",    "parameters":{"type":"object","properties":{"path":{"type":"string","description":"目录绝对路径"}},"required":["path"]}}},
+  {"type":"function","function":{"name":"read_file",    "description":"读取文件内容(只读, 限资料目录与工作目录, 超长截断)",    "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+  {"type":"function","function":{"name":"write_md",    "description":"写入markdown文件(唯一写工具, 限工作目录, 禁止覆盖他人产出)",    "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+  {"type":"function","function":{"name":"shell",    "description":"执行shell命令(实际测试/运行, 限工作目录cwd, 危险命令需主agent授权, 120s超时, 输出截断4000字符)",    "parameters":{"type":"object","properties":{"command":{"type":"string","description":"要执行的shell命令"}},"required":["command"]}}},
 ]
 
 def log(*a):
@@ -104,7 +75,10 @@ def t_read_file(args, ctx):
         return "错误: 不是文件: " + p
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
-            return f.read()
+            s = f.read(MAX_READ)
+            if f.read(1):
+                s += "\n...(截断: 文件超长)"
+            return s
     except Exception as e:
         return "错误: 读取失败: %s" % e
 
@@ -124,7 +98,57 @@ def t_write_md(args, ctx):
     ctx["wrote"].append(p)
     return "已写入: %s (%d字符)" % (p, len(c))
 
-TOOL_IMPL = {"list_dir": t_list_dir, "read_file": t_read_file, "write_md": t_write_md}
+AUTH_LOCK = threading.Lock()
+BLOCK_WORDS = ("rm","mkfs","dd","su","reboot","shutdown","poweroff","halt","fdisk","parted","mount","umount","chmod","chown","kill","pkill","killall","mv")
+
+def _authorize(c, ctx):
+    mode = ctx.get("auth_mode", "ask")
+    if mode == "allow":
+        return True, ""
+    if mode == "auto-deny":
+        return False, "危险命令被拒绝(auto-deny): "
+    with AUTH_LOCK:
+        print("[Booster] 主agent授权请求(30s无应答自动拒绝): %s" % c, file=sys.stderr, flush=True)
+        r, _, _ = select.select([sys.stdin], [], [], 30)
+        ans = sys.stdin.readline().strip().lower() if r else ""
+    if ans in ("y", "yes"):
+        return True, ""
+    return False, "危险命令被拒绝(超时/拒绝): "
+
+def _path_ok(c, ctx):
+    for p in re.findall(r"(?:^|\s)(/[^\s\"'`$;|&()<>]+)", c):
+        rp = os.path.realpath(p)
+        if rp.startswith(SYS_PREFIX):
+            continue
+        if os.path.exists(rp) and not inside(ctx["work"], rp) and not inside(ctx["docs"], rp):
+            return False, p
+    return True, None
+
+def t_shell(args, ctx):
+    c = args.get("command", "").strip()
+    if not c:
+        return "错误: 空命令"
+    if re.search(r"\|\s*(sh|bash|zsh)\b", c):
+        return "错误: 禁止管道执行shell, 已拦截"
+    ok, bad = _path_ok(c, ctx)
+    if not ok:
+        return "错误: 路径越权(仅限工作/资料目录): " + bad
+    flat = c.replace("\n", " ").replace(";", " ")
+    if DANGER_RE.search(c) or any(re.search(r"(^|[^A-Za-z0-9_])%s([^A-Za-z0-9_]|$)" % w, " " + flat + " ") for w in BLOCK_WORDS):
+        ok, msg = _authorize(c, ctx)
+        if not ok:
+            return "错误: " + msg + c
+    try:
+        r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=120, cwd=ctx["work"])
+        out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+        out = "[exit %d]\n" % r.returncode + out
+        return out if len(out) <= 4000 else out[:4000] + "\n...(截断)"
+    except subprocess.TimeoutExpired:
+        return "错误: 命令超时(120s)"
+    except Exception as e:
+        return "错误: 执行失败: %s" % e
+
+TOOL_IMPL = {"list_dir": t_list_dir, "read_file": t_read_file, "write_md": t_write_md, "shell": t_shell}
 
 def mock_llm(messages, cfg):
     n = sum(1 for m in messages if m["role"] == "tool")
@@ -206,8 +230,9 @@ def llm_call(messages, cfg):
     raise RuntimeError("LLM失败: " + last)
 
 def agent_session(messages, cfg, ctx):
-    ctx["wrote"] = []
-    for _ in range(TOOL_ROUNDS):
+    ctx = dict(ctx, wrote=[])
+    msg = {}
+    while True:
         resp = llm_call(messages, cfg)
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         tcs = msg.get("tool_calls") or []
@@ -224,18 +249,18 @@ def agent_session(messages, cfg, ctx):
             impl = TOOL_IMPL.get(name)
             result = impl(args, ctx) if impl else "未知工具: %s" % name
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": str(result)})
-    return None, False
 
 def phase1_dev(i, j, cfg, ctx):
     out = os.path.join(ctx["s1"], "module_%d" % i, "agent_%d.md" % j)
     cfg.stage_tag = "阶段1a"
+    gl = ("大目标: %s\n" % cfg.goal) if cfg.goal else ""
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "资料目录: %s\n文件清单:\n%s\n规则: 只读" % (
             ctx["docs"], "\n".join(list_files(ctx["docs"])) or "(空)")},
-        {"role": "user", "content": "[阶段] 模块开发\n你负责: module_%d 的变体 agent_%d\n"
+        {"role": "user", "content": "%s[阶段] 模块开发\n你负责: module_%d 的变体 agent_%d\n"
                                      "产出文件: %s\n要求: 单元化模块设计 + 单元测试清单全PASS, 测到死(一项不过不交付)" % (
-            i, j, out)},
+            gl, i, j, out)},
     ]
     cfg.module, cfg.variant, cfg.agent = "module_%d" % i, "agent_%d" % j, "agent%d_%d" % (i, j)
     content, ok = agent_session(msgs, cfg, ctx)
@@ -244,13 +269,14 @@ def phase1_dev(i, j, cfg, ctx):
 def phase1_eval(i, variants, cfg, ctx):
     out = os.path.join(ctx["s1e"], "module_%d.md" % i)
     cfg.stage_tag = "阶段1b"
-    vlist = "\n".join("stage1/module_%d/%s" % (i, os.path.basename(v)) for v in variants)
+    gl = ("大目标: %s\n" % cfg.goal) if cfg.goal else ""
+    vlist = "\n".join(v for v in variants)
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "工作目录: %s\n规则: 可读全部轮次产出(只读)" % ctx["work"]},
-        {"role": "user", "content": "[阶段] 模块评价\n你评价: module_%d 的 %d 个变体:\n%s\n"
+        {"role": "user", "content": "%s[阶段] 模块评价\n你评价: module_%d 的 %d 个变体:\n%s\n"
                                      "产出文件: %s\n要求: 输出评分表, 每行格式 | 文件名 | 总分 | 稳定 | 安全 | 轻量 |, "
-                                     "并标注淘汰最低分行: 淘汰: 文件名" % (i, len(variants), vlist, out)},
+                                     "并标注淘汰最低分行: 淘汰: 文件名" % (gl, i, len(variants), vlist, out)},
     ]
     cfg.module, cfg.agent = "module_%d" % i, "eval%d" % i
     content, ok = agent_session(msgs, cfg, ctx)
@@ -259,6 +285,7 @@ def phase1_eval(i, variants, cfg, ctx):
 def phase2_merge(k, combo, cfg, ctx):
     out = os.path.join(ctx["s2m"], "combo_%d" % k, "merged.md")
     cfg.stage_tag = "阶段2"
+    gl = ("大目标: %s\n" % cfg.goal) if cfg.goal else ""
     srcs = "\n".join("  %s" % p for p in combo["files"])
     msgs = [
         {"role": "system", "content": SYSTEM},
@@ -266,9 +293,9 @@ def phase2_merge(k, combo, cfg, ctx):
             ctx["docs"], "\n".join(list_files(ctx["docs"])) or "(空)")},
         {"role": "user", "content": "工作目录: %s\n组合清单: %s\n选定变体:\n%s\n规则: 可读全部" % (
             ctx["work"], combo["path"], srcs)},
-        {"role": "user", "content": "[阶段] 组合合并\n你负责: %s\n产出文件: %s\n"
+        {"role": "user", "content": "%s[阶段] 组合合并\n你负责: %s\n产出文件: %s\n"
                                      "要求: 合并为整体方案 + 集成测试全PASS, 测到死, 不行则排查排错" % (
-            combo["name"], out)},
+            gl, combo["name"], out)},
     ]
     cfg.combo, cfg.combo_src, cfg.agent = combo["name"], combo["name"], "merge%d" % k
     content, ok = agent_session(msgs, cfg, ctx)
@@ -277,15 +304,26 @@ def phase2_merge(k, combo, cfg, ctx):
 def phase3_review(k, merged, cfg, ctx):
     out = os.path.join(ctx["s3"], "review_%d.md" % k)
     cfg.stage_tag = "阶段3"
+    gl = ("大目标: %s\n" % cfg.goal) if cfg.goal else ""
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "工作目录: %s\n合并主体: %s\n规则: 可读全部(只读)" % (ctx["work"], merged)},
-        {"role": "user", "content": "[阶段] 组合审查\n你审查: combo_%d 合并主体\n产出文件: %s\n"
-                                     "要求: 多角度审查(安全/性能/完整性/测试覆盖), 结尾输出 SCORE: 数字" % (k, out)},
+        {"role": "user", "content": "%s[阶段] 组合审查\n你审查: combo_%d 合并主体\n产出文件: %s\n"
+                                     "要求: 多角度审查(安全/性能/完整性/测试覆盖), 结尾输出 SCORE: 数字" % (gl, k, out)},
     ]
     cfg.combo, cfg.combo_idx, cfg.agent = "combo_%d" % k, k, "review%d" % k
     content, ok = agent_session(msgs, cfg, ctx)
     return k, out, ok
+
+VERIFIED_RE = re.compile(r"(?m)^\s*(?:-\s*\[[xX]\]\s*)?.*?\bPASS\b")
+DENY_RE = re.compile(r"(?i)\b(not|no)\s+pass\b")
+
+def verified(txt):
+    items = re.findall(r"(?m)^\s*[-*]\s*\[(.)\]", txt)
+    return bool(items) and all(x in "xX" for x in items) \
+        and not DENY_RE.search(txt) \
+        and not re.search(r"(?im)^.*\b(FAIL|ERROR)\b", txt) \
+        and bool(VERIFIED_RE.search(txt))
 
 SCORE_RE = re.compile(r"\|\s*([\w.\-]+\.md)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|")
 SCORE_LINE_RE = re.compile(r"SCORE[:：]?\s*(\d+)")
@@ -310,23 +348,34 @@ def parse_review(path):
     m = SCORE_LINE_RE.search(txt)
     return int(m.group(1)) if m else None
 
-def pick_variant(scores, dim):
+def pick_variant(scores, dim, rng):
     if not scores:
         return None
-    return max(sorted(scores), key=lambda v: scores[v].get(dim, -1))
+    return max(rng.sample(sorted(scores), len(scores)), key=lambda v: scores[v].get(dim, -1))
 
-def build_combos(module_scores, combos, ctx, eliminated):
-    out = []
+def build_combos(module_scores, combos, ctx, eliminated, rng):
+    out, seen = [], set()
     for k, cname in enumerate(combos):
         dim = DIM_NAMES.get(cname, "score")
-        lines, files = [], []
+        lines, files, missing = [], [], []
         for mi in sorted(module_scores):
-            v = pick_variant({f: s for f, s in module_scores[mi].items() if f not in eliminated.get(mi, set())}, dim)
+            v = pick_variant({f: s for f, s in module_scores[mi].items() if f not in eliminated.get(mi, set())}, dim, rng)
             if not v:
+                missing.append(mi)
                 continue
             p = os.path.join(ctx["s1"], "module_%d" % mi, v)
             lines.append("- module_%d: %s" % (mi, p))
             files.append(p)
+        if missing:
+            log("警告: 组合 %s 缺模块: %s" % (cname, missing))
+        if not files:
+            log("警告: 组合 %s 无任何模块文件, 跳过" % cname)
+            continue
+        key = frozenset(files)
+        if key in seen:
+            log("组合 %s 与已有组合文件集重复, 跳过" % cname)
+            continue
+        seen.add(key)
         combo_path = os.path.join(ctx["s2"], "combo_%d.md" % k)
         with open(combo_path, "w", encoding="utf-8") as f:
             f.write("# combo_%d: %s 方向组合\n\n%s\n" % (k, cname, "\n".join(lines)))
@@ -341,7 +390,15 @@ def calc_workers(n, cfg):
 
 def run_pool(tasks, cfg):
     with ThreadPoolExecutor(max_workers=calc_workers(len(tasks), cfg)) as ex:
-        return list(ex.map(lambda t: t[0](*t[1]), tasks))
+        futs = [ex.submit(t[0], *t[1]) for t in tasks]
+        out = []
+        for f in futs:
+            try:
+                out.append(f.result())
+            except Exception as e:
+                log("代理异常(标记失败): %s" % e)
+                out.append(None)
+        return out
 
 def main():
     ap = argparse.ArgumentParser(description="Booster 模块化工程流水线: 并发开发->评分组合->合并测到死->审查交付", add_help=False)
@@ -353,11 +410,13 @@ def main():
     ap.add_argument("--combos", default="best,stability,safety,lightweight",
                     help="组合方向: best,stability,safety,lightweight 逗号分隔(默认全4)")
     ap.add_argument("--workers", type=int, default=0, help="并发数0-256, 0=全并行(默认)")
-    ap.add_argument("--key", help="用户授权API key(仅进程内, 不落盘)")
+    ap.add_argument("--key", default=os.environ.get("BOOSTER_KEY", ""), help="用户授权API key(仅进程内, 不落盘; 或环境变量 BOOSTER_KEY)")
     ap.add_argument("--model", default=MODEL, help="模型名(真调用必填; 或环境变量 BOOSTER_MODEL)")
     ap.add_argument("--api-url", default=API_URL, help="API地址(真调用必填; 或环境变量 BOOSTER_API_URL)")
     ap.add_argument("--mock", action="store_true", help="模拟LLM, 不联网不耗key")
-    ap.add_argument("--seed", type=int, default=None, help="随机种子")
+    ap.add_argument("--seed", type=int, default=None, help="随机种子(变体平局选择可复现)")
+    ap.add_argument("--auth-mode", choices=("ask", "auto-deny", "allow"), default="ask",
+                    help="危险命令授权: ask=询问30s超时拒绝(默认), auto-deny=直接拒绝, allow=放行")
     ap.add_argument("--json", action="store_true", help="输出结构化JSON")
     ap.add_argument("-h", "--help", action="help")
     args = ap.parse_args()
@@ -371,7 +430,7 @@ def main():
             sys.exit("错误: 未知组合方向 %s (可选: %s)" % (c, ",".join(DIM_NAMES)))
     if not args.mock:
         if not args.key:
-            sys.exit("错误: 非mock模式必须 --key 传入用户授权API key")
+            sys.exit("错误: 非mock模式必须 --key 或环境变量 BOOSTER_KEY 传入用户授权API key")
         if not args.api_url:
             sys.exit("错误: 非mock模式必须 --api-url 或环境变量 BOOSTER_API_URL")
         if not args.model:
@@ -379,6 +438,7 @@ def main():
 
     cfg = argparse.Namespace(mock=args.mock, key=args.key, model=args.model, api=args.api_url,
                              workers=args.workers, variants=x, goal=args.goal,
+                             seed=args.seed, auth_mode=args.auth_mode,
                              module="", variant="", combo="", combo_src="", combo_idx=0,
                              stage_tag="", agent="")
     docs, work = os.path.realpath(args.docs), os.path.realpath(args.work)
@@ -390,14 +450,14 @@ def main():
     for d in (s1, s1e, s2, s2m, s3):
         ensure(d)
     ctx = {"docs": docs, "work": work, "s1": s1, "s1e": s1e, "s2": s2,
-           "s2m": s2m, "s3": s3, "wrote": []}
+           "s2m": s2m, "s3": s3, "wrote": [], "auth_mode": args.auth_mode}
     if args.mock:
         log("MOCK模式: LLM决策模拟, 工具链真实执行, 不耗key")
 
     log("阶段1a: %d模块 x %d变体 = %d 子代理并发" % (n, x, n * x))
     tasks = [(phase1_dev, (i, j, copy.copy(cfg), ctx)) for i in range(n) for j in range(x)]
     res1 = run_pool(tasks, cfg)
-    ok1 = [r for r in res1 if r[3]]
+    ok1 = [r for r in res1 if r and r[3]]
     log("阶段1a产出: %d/%d 变体" % (len(ok1), n * x))
 
     variants_by_mod = {}
@@ -407,48 +467,59 @@ def main():
         vs = []
         for f in md_files(vd):
             with open(f, encoding="utf-8", errors="replace") as fh:
-                if "PASS" not in fh.read():
+                if not verified(fh.read()):
                     unverified.append(os.path.basename(f))
                     continue
             vs.append(f)
         variants_by_mod[i] = vs
     if unverified:
-        log("验收强制: %d 个变体无PASS标记 -> UNVERIFIED 不参与组合: %s" % (len(unverified), unverified))
+        log("验收强制: %d 个变体验收不过 -> UNVERIFIED 不参与组合: %s" % (len(unverified), unverified))
     if not all(variants_by_mod.values()):
         sys.exit("错误: 存在模块无通过验收的变体, 终止")
 
     log("阶段1b: %d 个评价子agent" % n)
     res2 = run_pool([(phase1_eval, (i, variants_by_mod[i], copy.copy(cfg), ctx)) for i in range(n)], cfg)
-    ok2 = [r for r in res2 if r[2]]
+    ok2 = [r for r in res2 if r and r[2]]
     log("阶段1b产出: %d/%d 评价md" % (len(ok2), n))
 
     module_scores, eliminated = {}, {}
-    for i, out, okk in res2:
+    for r in res2:
+        if not r:
+            continue
+        i, out, okk = r
         if not okk:
             continue
         scores, elim = parse_eval(out)
         if not scores:
-            sys.exit("错误: 评价md评分表解析失败: %s" % out)
+            log("警告: module_%d 评价解析失败, 该模块全部变体保留(不淘汰)" % i)
+            continue
         module_scores[i] = scores
         eliminated[i] = {elim} if elim else set()
         log("module_%d 评分: %s | 淘汰: %s" % (i, scores, elim))
-    if len(module_scores) < n:
-        sys.exit("错误: 评价产出不足, 终止")
-    combos_out = build_combos(module_scores, combos, ctx, eliminated)
+    if not module_scores:
+        sys.exit("错误: 所有模块评价均失败, 终止")
+    rng = random.Random(args.seed)
+    combos_out = build_combos(module_scores, combos, ctx, eliminated, rng)
     y = len(combos_out)
     log("阶段1c: 组装 %d 个组合方向: %s" % (y, [c["strategy"] for c in combos_out]))
 
     log("阶段2: %d 个合并子agent" % y)
     res3 = run_pool([(phase2_merge, (k, c, copy.copy(cfg), ctx)) for k, c in enumerate(combos_out)], cfg)
-    ok3 = [r for r in res3 if r[2]]
     merged_ok = []
-    for k, out, okk in res3:
-        if not okk or not os.path.isfile(out):
-            log("组合 %s 合并失败(无产出), 排除" % combos_out[k]["name"])
+    for k, c in enumerate(combos_out):
+        out = os.path.join(ctx["s2m"], "combo_%d" % k, "merged.md")
+        r = res3[k] if k < len(res3) else None
+        okk = bool(r and r[2] and os.path.isfile(out))
+        if not okk:
+            log("组合 %s 首次合并失败, 重试1次" % c["name"])
+            r = phase2_merge(k, c, copy.copy(cfg), ctx)
+            okk = bool(r and r[2] and os.path.isfile(out))
+        if not okk:
+            log("组合 %s 重试仍失败, 排除" % c["name"])
             continue
         with open(out, encoding="utf-8", errors="replace") as f:
-            if "PASS" not in f.read():
-                log("组合 %s 验收不过(无PASS), 排除" % combos_out[k]["name"])
+            if not verified(f.read()):
+                log("组合 %s 验收不过(无PASS), 排除" % c["name"])
                 continue
         merged_ok.append((k, out))
     log("阶段2产出: %d/%d 组合通过验收" % (len(merged_ok), y))
@@ -458,12 +529,13 @@ def main():
     log("阶段3: %d 个审查子agent" % len(merged_ok))
     res4 = run_pool([(phase3_review, (k, out, copy.copy(cfg), ctx)) for k, out in merged_ok], cfg)
     reviews = []
-    for k, out, okk in res4:
-        if not okk:
+    for r in res4:
+        if not r:
             continue
+        k, out, okk = r
         sc = parse_review(out)
-        if sc is None:
-            log("审查 %s 无SCORE, 无效" % out)
+        if sc is None or not (0 <= sc <= 10):
+            log("审查 %s 无有效SCORE(%s), 忽略" % (out, sc))
             continue
         reviews.append((k, sc, out))
         log("combo_%d 审查 SCORE=%d" % (k, sc))
