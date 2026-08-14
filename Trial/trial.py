@@ -81,15 +81,16 @@ def t_write_md(args, ctx):
         return "错误: 写入越权(仅限工作目录): " + p
     if not p.endswith(".md"):
         return "错误: 仅允许写入.md: " + p
-    if os.path.exists(p) and p not in ctx["wrote"]:
+    pr = os.path.realpath(p)
+    if os.path.exists(p) and pr not in ctx["wrote"]:
         return "错误: 目标已存在(禁止覆盖他人产出): " + p
-    d = os.path.dirname(p)
+    d = os.path.dirname(pr)
     if d:
         ensure(d)
-    with open(p, "w", encoding="utf-8") as f:
+    with open(pr, "w", encoding="utf-8") as f:
         f.write(c)
-    ctx["wrote"].append(p)
-    return "已写入: %s (%d字符)" % (p, len(c))
+    ctx["wrote"].append(pr)
+    return "已写入: %s (%d字符)" % (pr, len(c))
 
 TOOL_IMPL = {"list_dir": t_list_dir, "read_file": t_read_file, "write_md": t_write_md}
 
@@ -156,7 +157,12 @@ def llm_call(messages, cfg):
 def agent_session(messages, cfg, ctx):
     ctx = dict(ctx, wrote=[])
     msg = {}
+    max_turns = getattr(cfg, "max_turns", 0) or 0
+    turns = 0
     while True:
+        turns += 1
+        if max_turns and turns > max_turns:
+            return "错误: 超过最大轮次(%d), 中止" % max_turns, False
         resp = llm_call(messages, cfg)
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         tcs = msg.get("tool_calls") or []
@@ -179,7 +185,7 @@ def phase1_agent(i, goal, cfg, ctx):
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "资料目录: %s\n文件清单:\n%s\n规则: 只读" % (
-            ctx["docs"], "\n".join(list_files(ctx["docs"])) or "(空)")},
+            ctx["docs"], "\n".join(os.path.join(ctx["docs"], f) for f in list_files(ctx["docs"])) or "(空)")},
         {"role": "user", "content": "你的目标(第%d号):\n%s\n\n产出文件: %s\n必须用 write_md 写入" % (i + 1, goal, out)},
     ]
     cfg.agent, cfg.stage = "agent%d" % i, "阶段1"
@@ -191,9 +197,9 @@ def phase2_agent(i, cfg, ctx):
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "资料目录: %s\n文件清单:\n%s\n规则: 只读" % (
-            ctx["docs"], "\n".join(list_files(ctx["docs"])) or "(空)")},
+            ctx["docs"], "\n".join(os.path.join(ctx["docs"], f) for f in list_files(ctx["docs"])) or "(空)")},
         {"role": "user", "content": "工作目录: %s\n第一阶段产出md:\n%s\n规则: 可读全部第一阶段md用于整合" % (
-            ctx["work"], "\n".join(list_files(ctx["r1"])) or "(空)")},
+            ctx["work"], "\n".join(os.path.join(ctx["r1"], f) for f in list_files(ctx["r1"])) or "(空)")},
         {"role": "user", "content": "第二阶段目标: 通读工作目录全部第一阶段md, 整合修正为一份统一方案; "
                                      "可自由调整各子目标的实现方式与职责划分, 以整体方案最优为准。\n产出文件: %s" % out},
     ]
@@ -206,9 +212,9 @@ def phase3_agent(i, a, b, cfg, ctx):
     msgs = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": "资料目录: %s\n文件清单:\n%s\n规则: 只读" % (
-            ctx["docs"], "\n".join(list_files(ctx["docs"])) or "(空)")},
+            ctx["docs"], "\n".join(os.path.join(ctx["docs"], f) for f in list_files(ctx["docs"])) or "(空)")},
         {"role": "user", "content": "工作目录: %s\n当前方案md:\n%s" % (
-            ctx["work"], "\n".join(list_files(ctx["cur"])) or "(空)")},
+            ctx["work"], "\n".join(os.path.join(ctx["cur"], f) for f in list_files(ctx["cur"])) or "(空)")},
         {"role": "user", "content": "第三阶段目标: 比较 A=%s 与 B=%s 两份方案, "
                                      "整合/修正/改进为唯一方案; 明显劣势方可抛弃删减。\n产出文件: %s" % (a, b, out)},
     ]
@@ -258,9 +264,15 @@ def parse_goals(args):
     if args.goals:
         return [g.strip() for g in args.goals.split("|") if g.strip()]
     if args.goals_file:
-        with open(args.goals_file, encoding="utf-8") as f:
-            return [l.strip() for l in f if l.strip()]
-    return [str(g).strip() for g in json.loads(args.goals_json) if str(g).strip()]
+        try:
+            with open(args.goals_file, encoding="utf-8") as f:
+                return [l.strip() for l in f if l.strip()]
+        except OSError as e:
+            sys.exit("错误: 无法读取目标文件 %s: %s" % (args.goals_file, e))
+    try:
+        return [str(g).strip() for g in json.loads(args.goals_json) if str(g).strip()]
+    except ValueError as e:
+        sys.exit("错误: --goals-json 解析失败: %s" % e)
 
 def calc_workers(n, cfg):
     w = cfg.workers
@@ -289,6 +301,7 @@ def main():
     g.add_argument("--goals-file", help="目标文件, 每行一个")
     g.add_argument("--goals-json", help='目标JSON数组, 如 ["a","b","a"]')
     ap.add_argument("--workers", type=int, default=0, help="并发数0-256, 0=全并行(默认)")
+    ap.add_argument("--max-turns", type=int, default=0, help="单子代理最大LLM轮次, 0=无限(默认)")
     ap.add_argument("--key", default=os.environ.get("TRIAL_KEY", ""), help="用户授权API key(仅进程内, 不落盘; 或环境变量 TRIAL_KEY)")
     ap.add_argument("--model", default=MODEL, help="模型名(真调用必填; 或环境变量 TRIAL_MODEL)")
     ap.add_argument("--api-url", default=API_URL, help="API地址(真调用必填; 或环境变量 TRIAL_API_URL)")
@@ -311,6 +324,7 @@ def main():
 
     cfg = argparse.Namespace(mock=args.mock, key=args.key, model=args.model,
                              api=args.api_url, workers=args.workers,
+                             max_turns=args.max_turns,
                              agent="", stage="")
     docs, work = os.path.realpath(args.docs), os.path.realpath(args.work)
     if not os.path.isdir(docs):
@@ -340,6 +354,8 @@ def main():
     rounds_out["round2"] = [os.path.basename(r[1]) for r in ok2]
 
     cur_dir, cur = r2, [f for f in list_files(r2) if f.endswith(".md")]
+    if not cur:
+        sys.exit("错误: 阶段2无产出, 终止")
     rnd = 2
     rng = random.Random(args.seed)
     total_calls = len(goals) + len(r1_files)
@@ -375,7 +391,15 @@ def main():
         total_calls += calls
         log("阶段3-第%d轮: 输入%d -> 子代理%d(调用%d) -> 产出%d (淘汰%d)" % (
             rnd - 2, len(cur), calls, calls, len(okn), len(cur) - len(pairs)))
-        cur_dir, cur = nxt, [f for f in list_files(nxt) if f.endswith(".md")]
+        planned = ["agent_%d.md" % pi for pi in range(len(pairs))]
+        stray = os.path.join(nxt, "_stray")
+        for f in os.listdir(nxt):
+            if f.endswith(".md") and f not in planned:
+                ensure(stray)
+                shutil.move(os.path.join(nxt, f), os.path.join(stray, f))
+                log("孤儿文件移入 _stray: %s" % f)
+        cur = [f for f in planned if os.path.isfile(os.path.join(nxt, f))]
+        cur_dir = nxt
         rounds_out["round%d" % rnd] = [os.path.basename(f) for f in cur]
         if len(cur) == 0:
             sys.exit("错误: 阶段3某轮无产出, 终止")

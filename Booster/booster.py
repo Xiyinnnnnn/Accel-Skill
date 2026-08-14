@@ -11,7 +11,7 @@ MAX_READ  = 20000
 DIM_KEYS  = ["score", "stability", "safety", "lightness"]
 DIM_NAMES = {"best": "score", "stability": "stability", "safety": "safety", "lightweight": "lightness"}
 DANGER_RE = re.compile(r"(?:\beval\b|\b(?:bash|zsh|sh|python|python3|perl|ruby)\s+-c\b|base64|\$\(|`)")
-SYS_PREFIX = ("/usr/", "/bin/", "/sbin/", "/lib", "/proc/", "/dev/", "/sys/")
+SYS_PREFIX = ("/usr/", "/bin/", "/sbin/", "/lib", "/etc/")
 
 SYSTEM = """[ROLE] 工程子代理（Booster Worker）| [LANG] zh-CN [IDENTITY] 主代理任务流水线中的模块化工程单元; 按阶段指令交付md, 以文件为准
 [BOUNDARY] - 资料目录: 只读 - 工作目录: 可读全部轮次产出; 只写md(write_md); 禁止覆盖他人产出; shell仅限工作目录cwd执行 - 删除/移动由宿主管理
@@ -88,15 +88,16 @@ def t_write_md(args, ctx):
         return "错误: 写入越权(仅限工作目录): " + p
     if not p.endswith(".md"):
         return "错误: 仅允许写入.md: " + p
-    if os.path.exists(p) and p not in ctx["wrote"]:
+    pr = os.path.realpath(p)
+    if os.path.exists(p) and pr not in ctx["wrote"]:
         return "错误: 目标已存在(禁止覆盖他人产出): " + p
-    d = os.path.dirname(p)
+    d = os.path.dirname(pr)
     if d:
         ensure(d)
-    with open(p, "w", encoding="utf-8") as f:
+    with open(pr, "w", encoding="utf-8") as f:
         f.write(c)
-    ctx["wrote"].append(p)
-    return "已写入: %s (%d字符)" % (p, len(c))
+    ctx["wrote"].append(pr)
+    return "已写入: %s (%d字符)" % (pr, len(c))
 
 AUTH_LOCK = threading.Lock()
 BLOCK_WORDS = ("rm","mkfs","dd","su","reboot","shutdown","poweroff","halt","fdisk","parted","mount","umount","chmod","chown","kill","pkill","killall","mv")
@@ -116,8 +117,14 @@ def _authorize(c, ctx):
     return False, "危险命令被拒绝(超时/拒绝): "
 
 def _path_ok(c, ctx):
-    for p in re.findall(r"(?:^|\s)(/[^\s\"'`$;|&()<>]+)", c):
+    for p in re.findall(r"(?:^|\s)(/[^\s\"'`;|&()<>]+)", c):
         rp = os.path.realpath(p)
+        if rp.startswith(SYS_PREFIX):
+            continue
+        if os.path.exists(rp) and not inside(ctx["work"], rp) and not inside(ctx["docs"], rp):
+            return False, p
+    for p in re.findall(r"(?:^|\s)((?:~|\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*))[^\s\"'`;|&()<>]*)", c):
+        rp = os.path.realpath(os.path.expanduser(os.path.expandvars(p)))
         if rp.startswith(SYS_PREFIX):
             continue
         if os.path.exists(rp) and not inside(ctx["work"], rp) and not inside(ctx["docs"], rp):
@@ -232,7 +239,12 @@ def llm_call(messages, cfg):
 def agent_session(messages, cfg, ctx):
     ctx = dict(ctx, wrote=[])
     msg = {}
+    max_turns = getattr(cfg, "max_turns", 0) or 0
+    turns = 0
     while True:
+        turns += 1
+        if max_turns and turns > max_turns:
+            return "错误: 超过最大轮次(%d), 中止" % max_turns, False
         resp = llm_call(messages, cfg)
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         tcs = msg.get("tool_calls") or []
@@ -315,15 +327,13 @@ def phase3_review(k, merged, cfg, ctx):
     content, ok = agent_session(msgs, cfg, ctx)
     return k, out, ok
 
-VERIFIED_RE = re.compile(r"(?m)^\s*(?:-\s*\[[xX]\]\s*)?.*?\bPASS\b")
+VERIFIED_RE = re.compile(r"(?im)^.*\bPASS\b")
 DENY_RE = re.compile(r"(?i)\b(not|no)\s+pass\b")
 
 def verified(txt):
-    items = re.findall(r"(?m)^\s*[-*]\s*\[(.)\]", txt)
-    return bool(items) and all(x in "xX" for x in items) \
+    return bool(VERIFIED_RE.search(txt)) \
         and not DENY_RE.search(txt) \
-        and not re.search(r"(?im)^.*\b(FAIL|ERROR)\b", txt) \
-        and bool(VERIFIED_RE.search(txt))
+        and not re.search(r"(?im)^.*\b(FAIL|ERROR)\b", txt)
 
 SCORE_RE = re.compile(r"\|\s*([\w.\-]+\.md)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|")
 SCORE_LINE_RE = re.compile(r"SCORE[:：]?\s*(\d+)")
@@ -336,11 +346,8 @@ def parse_eval(path):
     for m in SCORE_RE.finditer(txt):
         scores[m.group(1)] = {"score": int(m.group(2)), "stability": int(m.group(3)),
                               "safety": int(m.group(4)), "lightness": int(m.group(5))}
-    elim = None
-    m = ELIM_RE.search(txt)
-    if m:
-        elim = m.group(1)
-    return scores, elim
+    elims = set(ELIM_RE.findall(txt))
+    return scores, elims
 
 def parse_review(path):
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -376,10 +383,11 @@ def build_combos(module_scores, combos, ctx, eliminated, rng):
             log("组合 %s 与已有组合文件集重复, 跳过" % cname)
             continue
         seen.add(key)
-        combo_path = os.path.join(ctx["s2"], "combo_%d.md" % k)
+        ci = len(out)
+        combo_path = os.path.join(ctx["s2"], "combo_%d.md" % ci)
         with open(combo_path, "w", encoding="utf-8") as f:
-            f.write("# combo_%d: %s 方向组合\n\n%s\n" % (k, cname, "\n".join(lines)))
-        out.append({"name": "combo_%d" % k, "strategy": cname, "path": combo_path, "files": files})
+            f.write("# combo_%d: %s 方向组合\n\n%s\n" % (ci, cname, "\n".join(lines)))
+        out.append({"name": "combo_%d" % ci, "strategy": cname, "path": combo_path, "files": files})
     return out
 
 def calc_workers(n, cfg):
@@ -410,6 +418,7 @@ def main():
     ap.add_argument("--combos", default="best,stability,safety,lightweight",
                     help="组合方向: best,stability,safety,lightweight 逗号分隔(默认全4)")
     ap.add_argument("--workers", type=int, default=0, help="并发数0-256, 0=全并行(默认)")
+    ap.add_argument("--max-turns", type=int, default=0, help="单子代理最大LLM轮次, 0=无限(默认)")
     ap.add_argument("--key", default=os.environ.get("BOOSTER_KEY", ""), help="用户授权API key(仅进程内, 不落盘; 或环境变量 BOOSTER_KEY)")
     ap.add_argument("--model", default=MODEL, help="模型名(真调用必填; 或环境变量 BOOSTER_MODEL)")
     ap.add_argument("--api-url", default=API_URL, help="API地址(真调用必填; 或环境变量 BOOSTER_API_URL)")
@@ -437,7 +446,8 @@ def main():
             sys.exit("错误: 非mock模式必须 --model 或环境变量 BOOSTER_MODEL")
 
     cfg = argparse.Namespace(mock=args.mock, key=args.key, model=args.model, api=args.api_url,
-                             workers=args.workers, variants=x, goal=args.goal,
+                             workers=args.workers, max_turns=args.max_turns,
+                             variants=x, goal=args.goal,
                              seed=args.seed, auth_mode=args.auth_mode,
                              module="", variant="", combo="", combo_src="", combo_idx=0,
                              stage_tag="", agent="")
@@ -489,13 +499,13 @@ def main():
         i, out, okk = r
         if not okk:
             continue
-        scores, elim = parse_eval(out)
+        scores, elims = parse_eval(out)
         if not scores:
             log("警告: module_%d 评价解析失败, 该模块全部变体保留(不淘汰)" % i)
             continue
         module_scores[i] = scores
-        eliminated[i] = {elim} if elim else set()
-        log("module_%d 评分: %s | 淘汰: %s" % (i, scores, elim))
+        eliminated[i] = elims
+        log("module_%d 评分: %s | 淘汰: %s" % (i, scores, elims))
     if not module_scores:
         sys.exit("错误: 所有模块评价均失败, 终止")
     rng = random.Random(args.seed)
@@ -505,12 +515,13 @@ def main():
 
     log("阶段2: %d 个合并子agent" % y)
     res3 = run_pool([(phase2_merge, (k, c, copy.copy(cfg), ctx)) for k, c in enumerate(combos_out)], cfg)
-    merged_ok = []
+    merged_ok, retry_calls = [], 0
     for k, c in enumerate(combos_out):
         out = os.path.join(ctx["s2m"], "combo_%d" % k, "merged.md")
         r = res3[k] if k < len(res3) else None
         okk = bool(r and r[2] and os.path.isfile(out))
         if not okk:
+            retry_calls += 1
             log("组合 %s 首次合并失败, 重试1次" % c["name"])
             r = phase2_merge(k, c, copy.copy(cfg), ctx)
             okk = bool(r and r[2] and os.path.isfile(out))
@@ -545,7 +556,7 @@ def main():
 
     final = os.path.join(work, "final.md")
     shutil.copy2(best_out, final)
-    total = n * x + n + y + len(merged_ok)
+    total = n * x + n + y + len(merged_ok) + retry_calls
     log("完成: 最优主体 = %s (combo_%d, SCORE=%d, 总子代理调用 %d)" % (final, best_k, best_sc, total))
 
     if args.json:

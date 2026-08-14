@@ -77,7 +77,7 @@ flowchart LR
     E --> F["final.md 最优主体"]
 ```
 
-**测到死**：每模块变体必须含单元测试清单全 PASS 才参与组合；合并必须集成测试 PASS；审查必须 SCORE 可解析——程序层强制，一项不过不进入交付。
+**测到死**：每模块变体必须含 PASS 验收标记且无 FAIL/ERROR/NOT PASS 才参与组合；合并同理；审查必须 SCORE 可解析——程序层强制，一项不过不进入交付。
 
 ---
 
@@ -112,9 +112,9 @@ flowchart LR
 ## 技术底座
 
 - **超轻量**：单文件纯标准库（无第三方依赖），`#!/usr/bin/env python3` 直接跑
-- **安全**：realpath 路径校验（读限资料/工作目录、写限工作目录）、覆盖他人产出拒绝、危险操作全由宿主管理
+- **安全**：realpath 路径校验（读限资料/工作目录、写限工作目录）、覆盖他人产出拒绝、危险操作全由宿主管理；shell 路径越权检查覆盖绝对路径与 ~/$HOME/${VAR}（展开后校验），系统路径白名单 /usr/ /bin/ /sbin/ /lib /etc/，/proc/ /dev/ /sys/ 不放行
 - **重型 prompt**：子 agent SYSTEM 写死（ROLE/IDENTITY/BOUNDARY/THINK/MUST/EXAMPLE/RULES），工具 schema 写死（list_dir/read_file/write_md）
-- **agent 友好**：`--json` 结构化输出、退出码语义化、目标三来源
+- **agent 友好**：`--json` 结构化输出、退出码语义化、目标三来源；单子代理工具轮次默认无限（设计），真调用可用 `--max-turns` 兜底
 
 ## 协议
 
