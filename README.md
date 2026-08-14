@@ -33,6 +33,14 @@ curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster
 curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster/Accel-Skill-Booster-skill.md   -o ~/skills/Booster/Accel-Skill-Booster-skill.md
 ```
 
+# 方式三：DeepSeek Harness 插件（一键载入）
+
+```bash
+npx @deepseek-ai/dsh plugin --profile web add dsh-accel-skill
+```
+
+载入后模型获得 `accel_trial` / `accel_booster` 两个工具，参数与上方 CLI 一一对应；key 走 DSH 进程环境（`DEEPSEEK_API_KEY` 或插件 config.key），不进入模型上下文。源码适配层位于仓库 `dsh/`（Cordis 插件，纯 ESM 零构建），npm 包名 `dsh-accel-skill`。
+
 部署后 3 秒上手：
 
 ```bash
