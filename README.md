@@ -28,9 +28,9 @@ git clone --depth 1 https://github.com/Xiyinnnnnn/Accel-Skill.git ~/skills
 # 方式二：单文件直取（只要宿主，不需要协议）
 mkdir -p ~/skills/{Trial,Booster}
 curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Trial/trial.py    -o ~/skills/Trial/trial.py
-curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Trial/skill.md    -o ~/skills/Trial/skill.md
+curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Trial/Accel-Skill-Trial-skill.md    -o ~/skills/Trial/Accel-Skill-Trial-skill.md
 curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster/booster.py -o ~/skills/Booster/booster.py
-curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster/skill.md   -o ~/skills/Booster/skill.md
+curl -fsSL https://raw.githubusercontent.com/Xiyinnnnnn/Accel-Skill/main/Booster/Accel-Skill-Booster-skill.md   -o ~/skills/Booster/Accel-Skill-Booster-skill.md
 ```
 
 部署后 3 秒上手：
